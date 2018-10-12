@@ -41,4 +41,6 @@ if __name__=='__main__':
                     for sten in data['alternatives'].strip().split('\t'):
                         word_list.append(' '.join([str(word_dic[word]) for word in sten.split(' ')]))
                     line_dic['alternatives'] = '\t'.join(word_list)
-                    out_fo.write(json.dumps(line_dic) + '\n')
+                    line_dic['alternatives_raw']=data['alternatives_raw']
+                    line_dic['query_id']=data['query_id']
+                    out_fo.write(json.dumps(line_dic,ensure_ascii=False) + '\n')

@@ -40,11 +40,13 @@ if __name__ =='__main__':
                         line_dic[key]=' '.join([word.strip() for word in jb.cut(data[key])])
 
                     alternatives = [word.strip() for word in data['alternatives'].split('|')]
+                    line_dic['alternatives_raw'] = alternatives
                     try:
                         line_dic['answer']=alternatives.index(data['answer'].strip())
                     except:
                         pass
                     line_dic['alternatives']='\t'.join([' '.join([word.strip() for word in jb.cut(sten.strip())]) for sten in alternatives])
+                    line_dic['query_id']=data['query_id']
                     out_fo.write(json.dumps(line_dic,ensure_ascii=False)+'\n')
 
 

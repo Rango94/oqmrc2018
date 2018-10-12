@@ -81,6 +81,7 @@ class Oqmrc_Model:
             alternatives_output_0, alternatives_state_0 = dynamic_rnn(self.alternatives_cell, alternatives_emb_0,sequence_length=self.alternatives_len_input[:,0], dtype=tf.float32)
             alternatives_output_1, alternatives_state_1 = dynamic_rnn(self.alternatives_cell, alternatives_emb_1,sequence_length=self.alternatives_len_input[:,1],dtype=tf.float32)
             alternatives_output_2, alternatives_state_2 = dynamic_rnn(self.alternatives_cell, alternatives_emb_2,sequence_length=self.alternatives_len_input[:,2],dtype=tf.float32)
+
         query_state=self.get_h(query_state)
 
         alternatives_state=tf.concat([self.get_h(alternatives_state_0),self.get_h(alternatives_state_1),self.get_h(alternatives_state_2)],axis=1)
@@ -90,8 +91,10 @@ class Oqmrc_Model:
         self.final_state=tf.concat([query_state,passage_state],axis=1)
 
         tmp=tf.matmul(tf.reshape(alternatives_state,shape=[-1,self.hidden_size]),self.similar_weight)
-        tmp=tf.reshape(tmp,shape=[-1,self.hidden_size*2,3])
-        self.middle_out=tf.matmul(tf.reshape(self.final_state,shape=[-1,1,self.hidden_size*2]),tmp)
+
+        tmp=tf.reshape(tmp,shape=[-1,3,self.hidden_size*2])
+
+        self.middle_out=tf.reshape(tf.matmul(tmp,tf.reshape(self.final_state,shape=[-1,self.hidden_size*2,1])),shape=[-1,3])
 
     def get_h(self, state):
         c, h = state[-1]
@@ -113,13 +116,17 @@ class Oqmrc_Model:
             shape=[-1, self.hidden_size])
 
     def computer_loss(self):
-        self.loss=tf.nn.softmax_cross_entropy_with_logits_v2(labels=tf.reshape(self.y_input,shape=[-1,1]),logits=self.middle_out)
+        tf.add_to_collection("losses", tf.contrib.layers.l2_regularizer(0.2)(self.similar_weight))
+        tf.add_to_collection("losses",
+                             tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.y_input,
+                                                                                           logits=self.middle_out)))
+        self.loss=tf.add_n(tf.get_collection("losses"))
 
     def _train(self):
         trainable_variables = tf.trainable_variables()
         grads = tf.gradients(self.loss, trainable_variables)
         grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
-        opt = tf.train.AdadeltaOptimizer(learning_rate=self.lr)
+        opt = tf.train.AdadeltaOptimizer(learning_rate=tf.clip_by_value(self.lr,0.01,5))
         self.train_op = opt.apply_gradients(zip(grads, trainable_variables),global_step=self.global_step)
 
 
