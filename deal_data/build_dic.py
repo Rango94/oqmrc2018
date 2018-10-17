@@ -11,10 +11,12 @@
 '''
 import json
 import jieba as jb
-
+jb.add_word('不')
+jb.add_word('无法确定')
 #332270
 #331871
 #321301
+#321308
 word_dic={}
 n=0
 word_dic['##1']=n
@@ -62,7 +64,7 @@ for file in filelist:
 
 print(len(word_dic))
 
-with open('word_dic','w',encoding='utf-8') as fo:
+with open('../../DATA/data/word_dic','w',encoding='utf-8') as fo:
     json.dump(word_dic,fo,ensure_ascii=False)
 
 

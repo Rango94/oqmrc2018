@@ -14,7 +14,7 @@ if __name__=='__main__':
     filelist=['../../DATA/data/ai_challenger_oqmrc_trainingset.json',
                   '../../DATA/data/ai_challenger_oqmrc_testa.json',
                   '../../DATA/data/ai_challenger_oqmrc_validationset.json']
-    with open('word_dic','r',encoding='utf-8') as fo:
+    with open('../../DATA/data/word_dic','r',encoding='utf-8') as fo:
         word_dic=json.load(fo)
 
     for file in filelist:
