@@ -19,16 +19,16 @@ if __name__=='__main__':
         'max_len_query':20,
         'max_len_alternatives':5}
     dh = data_helper(dh_config)
-    config={'hidden_size':70,
+    config={'hidden_size':50,
         'num_layers':1,
         'word_dim':128,
         'voc_len':dh.voc_len,
         'max_len_passage':dh_config['max_len_passage'],
         'max_len_query':dh_config['max_len_query'],
         'max_len_alternatives':dh_config['max_len_alternatives'],
-        'lr':0.5,
+        'lr':2.,
         'max_grad_norm':5,
-        'model_name':'MANM_2'}
+        'model_name':'MANM_4'}
 
     print('字典长度%d'%dh.voc_len)
 
@@ -40,6 +40,10 @@ if __name__=='__main__':
         oqmrc_model=MANM_2_Model(config)
     elif config['model_name']=='MANM_3':
         oqmrc_model=MANM_3_Model(config)
+    elif config['model_name']=='MANM_4':
+        oqmrc_model=MANM_4_Model(config)
+    elif config['model_name']=='MANM_5':
+        oqmrc_model = MANM_5_Model(config)
 
     sess_config = tf.ConfigProto()
     sess_config.gpu_options.allow_growth = True
@@ -60,14 +64,12 @@ if __name__=='__main__':
         save_mark=0
         loss_on_train=1
         for i in range(100000):
-
             if i%100==0:
                 data_dic = dh.get_val_data()
                 out=oqmrc_model.val_(sess,[oqmrc_model.loss,oqmrc_model.middle_out,oqmrc_model.lr,oqmrc_model.loss_l2],feed_dict=data_dic)
-                # for tmp in oqmrc_model.val_(sess,[oqmrc_model.tmp],feed_dict=data_dic):
-                #     for i in tmp[0]:
-                #         print(i)
-                #     break
+                for tmp in oqmrc_model.val_(sess,[oqmrc_model.tmp],feed_dict=data_dic):
+                    print(tmp[0])
+                    break
                 loss=0
                 pre=0
                 lr=0
@@ -95,7 +97,7 @@ if __name__=='__main__':
                     saver.save(sess, file_pre+config['model_name']+'_model')
                     save_mark=pre
 
-            data_dic=dh.next_batch(337)
+            data_dic=dh.next_batch(437)
             _,loss_on_train=sess.run([oqmrc_model.train_op,oqmrc_model.loss],feed_dict={oqmrc_model.query_input:data_dic['query'],
                                                     oqmrc_model.query_len_input:data_dic['query_len'],
                                                     oqmrc_model.passage_input:data_dic['passage'],
@@ -103,6 +105,6 @@ if __name__=='__main__':
                                                     oqmrc_model.alternatives_input:data_dic['alternative'],
                                                     oqmrc_model.alternatives_len_input: data_dic['alternative_len'],
                                                     oqmrc_model.y_input:data_dic['answer'],
-                                                    oqmrc_model.keep_pro:0.8,})
+                                                    oqmrc_model.keep_pro:0.6,})
 
     # writer.close()

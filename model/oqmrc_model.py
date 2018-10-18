@@ -768,16 +768,13 @@ class MANM_3_Model:
 
 
     def forward_step1(self,alternatives_state,query_output,passage_output):
-
         query_passage_concated=self.word_level_attention(alternatives_state,tf.concat(query_output,2),tf.concat(passage_output,2),
                                                               self.query_len_input,self.passage_len_input)
-
         concated = tf.concat([query_passage_concated, alternatives_state], axis=1)
         return concated
 
 
     def forward_step2(self,concated):
-
         for idx, (weight, bias) in enumerate(self.auto_NN['output_layer']):
             if idx % 2 == 0:
                 concated = tf.nn.elu(tf.matmul(concated, weight) + bias)
@@ -857,6 +854,443 @@ class MANM_3_Model:
         trainable_variables = tf.trainable_variables()
         grads = tf.gradients(self.loss, trainable_variables)
         # grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
+        opt = tf.train.AdadeltaOptimizer(learning_rate=tf.clip_by_value(self.lr,0.01,5))
+        self.train_op = opt.apply_gradients(zip(grads, trainable_variables),global_step=self.global_step)
+
+    def val_(self, sess, tensor_list, feed_dict):
+        max_len=len(feed_dict['query'])
+        scale=1500
+        out=[]
+        for i in range(10000):
+            out.append(sess.run(tensor_list,feed_dict={self.query_input: feed_dict['query'][i * scale:min((i + 1) * scale, max_len)],
+                              self.query_len_input: feed_dict['query_len'][i * scale:min((i + 1) * scale, max_len)],
+                              self.passage_input: feed_dict['passage'][i * scale:min((i + 1) * scale, max_len)],
+                              self.passage_len_input: feed_dict['passage_len'][i * scale:min((i + 1) * scale, max_len)],
+                              self.alternatives_input: feed_dict['alternative'][i * scale:min((i + 1) * scale, max_len)],
+                              self.alternatives_len_input: feed_dict['alternative_len'][i * scale:min((i + 1) * scale, max_len)],
+                              self.y_input: feed_dict['answer'][i * scale:min((i + 1) * scale, max_len)],
+                              self.keep_pro: 1}))
+            if (i+1)*scale>=max_len:
+                break
+        return out
+
+class MANM_4_Model:
+
+    def __init__(self,config):
+        self.hidden_size=config['hidden_size']
+        self.num_layers=config['num_layers']
+        self.word_dim=config['word_dim']
+        self.voc_len=config['voc_len']
+
+        self.max_len_passage=config['max_len_passage']
+        self.max_len_query = config['max_len_query']
+        self.max_len_alternatives=config['max_len_alternatives']
+        self.output_layer_num=5
+
+        self.global_step = tf.Variable(0)
+        self.lr = tf.train.exponential_decay(config['lr'], self.global_step, 800, 0.96, staircase=True)
+
+        self.max_grad_norm=config['max_grad_norm']
+        self.auto_NN={}
+        self.build_placeholder()
+        self.build_para()
+        self.forward_step0()
+        self.computer_loss()
+        self._train()
+
+    def build_placeholder(self):
+        self.keep_pro=tf.placeholder(dtype=tf.float32,name='keep_pro')
+
+        self.query_input=tf.placeholder(dtype=tf.int32,shape=[None,self.max_len_query],name='query_input')
+        self.passage_input=tf.placeholder(dtype=tf.int32,shape=[None,self.max_len_passage],name='passage_input')
+
+        self.query_len_input = tf.placeholder(dtype=tf.int32, shape=[None], name='query_len_input')
+        self.passage_len_input = tf.placeholder(dtype=tf.int32, shape=[None], name='passage_len_input')
+
+        self.y_input=tf.placeholder(dtype=tf.int32,shape=[None],name='y_input')
+        self.alternatives_input=tf.placeholder(dtype=tf.int32,shape=[None,3,self.max_len_alternatives],name='alternatives_input')
+        self.alternatives_len_input=tf.placeholder(dtype=tf.int32,shape=[None,3],name='alternatives_len_input')
+
+    def build_para(self):
+        self.initializer = tf.random_uniform_initializer(-0.1, 0.1)
+        with tf.variable_scope('word_embedding'):
+            print('loading embedding')
+            self.word_embedding=tf.get_variable(dtype=tf.float32,
+                                                initializer=tf.constant(np.load('../../DATA/data/embedding.npy'),
+                                                                        dtype=tf.float32),name='word_embedding',trainable=True)
+            print('done')
+        with tf.variable_scope('LSTM_encoder',reuse=None):
+
+            self.query_cell_fw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+
+            self.query_cell_bw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+
+            self.passage_cell_fw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+            self.passage_cell_bw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+
+            self.alternatives_cell=tf.nn.rnn_cell.LSTMCell(self.hidden_size)
+
+        with tf.variable_scope('attention'):
+            self.attention_weight=tf.get_variable(dtype=tf.float32,shape=[self.hidden_size*2,self.hidden_size*2],initializer=self.initializer,name='attention_weight')
+        with tf.variable_scope('output_layer'):
+            self.generate_NN(self.hidden_size*5,1, self.output_layer_num,'output_layer')
+
+    def generate_NN(self,input_size,output_size,layers,name):
+        auto_NN_weights=[]
+        auto_NN_biases=[]
+        auto_NN_betas=[]
+        auto_NN_scales=[]
+        for i in range(layers):
+            if i==layers-1:
+                auto_NN_weights.append(tf.get_variable(dtype=tf.float32,shape=[input_size,output_size],
+                                                       name='auto_NN_weight_'+name+'_'+str(i),initializer=self.initializer))
+                auto_NN_biases.append(tf.get_variable(dtype=tf.float32,shape=[output_size],
+                                                      name='auto_NN_bias_'+name+'_'+str(i),initializer=self.initializer))
+            else:
+                auto_NN_weights.append(tf.get_variable(dtype=tf.float32, shape=[input_size , input_size ],
+                                                       name='auto_NN_weight_' +name+'_'+ str(i),initializer=self.initializer))
+                auto_NN_biases.append(tf.get_variable(dtype=tf.float32, shape=[input_size ],
+                                                      name='auto_NN_bias_' + name+'_'+str(i),initializer=self.initializer))
+
+            auto_NN_betas.append(tf.get_variable(dtype=tf.float32, shape=[1],name='auto_NN_beta_' +name+'_'+ str(i),initializer=self.initializer))
+            auto_NN_scales.append(tf.get_variable(dtype=tf.float32, shape=[1],name='auto_NN_scale_' + name + '_' + str(i),initializer=self.initializer))
+        self.auto_NN[name]=zip(auto_NN_weights,auto_NN_biases,auto_NN_betas,auto_NN_scales)
+
+    def forward_step0(self):
+        #这一部分主要是lstm编码过程
+        query_emb=tf.nn.embedding_lookup(self.word_embedding,self.query_input)
+
+        passage_emb = tf.nn.embedding_lookup(self.word_embedding, self.passage_input)
+
+        alternatives_emb_0 = tf.nn.embedding_lookup(self.word_embedding, self.alternatives_input[:, 0, :])
+        alternatives_emb_1 = tf.nn.embedding_lookup(self.word_embedding, self.alternatives_input[:, 1, :])
+        alternatives_emb_2 = tf.nn.embedding_lookup(self.word_embedding, self.alternatives_input[:, 2, :])
+
+        alternatives_emb=[alternatives_emb_0,alternatives_emb_1,alternatives_emb_2]
+
+        with tf.variable_scope('query_encoder'):
+            query_output, query_state = tf.nn.bidirectional_dynamic_rnn(self.query_cell_fw, self.query_cell_bw,
+                                                                                  query_emb, sequence_length=self.query_len_input, dtype=tf.float32)
+        with tf.variable_scope('passage_encoder'):
+            passage_output,passage_state=tf.nn.bidirectional_dynamic_rnn(self.passage_cell_fw, self.passage_cell_bw,
+                                                                                   passage_emb, sequence_length=self.passage_len_input, dtype=tf.float32)
+        with tf.variable_scope('alternatives_encoder'):
+            alternatives_output_0, alternatives_state_0 = dynamic_rnn(self.alternatives_cell, alternatives_emb[0],
+                                                                  sequence_length=self.alternatives_len_input[:,0], dtype=tf.float32)
+            alternatives_output_1, alternatives_state_1 = dynamic_rnn(self.alternatives_cell, alternatives_emb[1],
+                                                                sequence_length=self.alternatives_len_input[:, 1], dtype=tf.float32)
+            alternatives_output_2, alternatives_state_2 = dynamic_rnn(self.alternatives_cell, alternatives_emb[2],
+                                                                  sequence_length=self.alternatives_len_input[:, 2],
+                                                                  dtype=tf.float32)
+
+        alternatives_state=[self.get_h(alternatives_state_0),
+                            self.get_h(alternatives_state_1),
+                            self.get_h(alternatives_state_2)]
+        query_output=tf.concat(query_output,axis=2)
+        passage_output=tf.concat(passage_output,axis=2)
+        tmp0=self.forward_step1(alternatives_state[0], query_output, passage_output)
+        tmp1=self.forward_step1(alternatives_state[1], query_output, passage_output)
+        tmp2=self.forward_step1(alternatives_state[2], query_output, passage_output)
+        self.tmp=tf.concat([tmp0,tmp1,tmp2],axis=0)
+        self.middle_out=tf.transpose(tf.reshape(self.forward_step2(tf.concat([tmp0,tmp1,tmp2],axis=0)),[3,-1]))
+
+
+    def forward_step1(self,alternatives_state,query_output,passage_output):
+        query_attentioned=self.compute_attention(alternatives_state,query_output,passage_output,self.query_len_input,
+                                                 self.passage_len_input,self.max_len_query,self.max_len_passage)
+        passage_attentioned=self.compute_attention(alternatives_state,passage_output,query_output,self.passage_len_input,
+                                                   self.query_len_input,self.max_len_passage,self.max_len_query)
+        concated = tf.concat([query_attentioned,passage_attentioned, alternatives_state], axis=1)
+        return concated
+
+    def forward_step2(self,concated):
+        for idx, (weight, bias,beta,scale) in enumerate(self.auto_NN['output_layer']):
+            tmp=tf.nn.elu(tf.matmul(concated, weight) + bias)
+            batch_mean, batch_var = tf.nn.moments(tmp, [0])
+            BN = tf.nn.batch_normalization(tmp, batch_mean, batch_var, beta, scale, 1e-3)
+            if idx==self.output_layer_num-1:
+                concated=BN
+            else:
+                concated = tf.nn.dropout(BN,keep_prob=self.keep_pro)
+
+        return concated
+
+    def get_h(self, state):
+        c, h = state
+        h = tf.reshape(h, [-1, self.hidden_size])
+        return h
+
+    def compute_attention(self,alternatives_state,outputs1,outputs2,len1,len2,max_len1,max_len2):
+
+        # alternatives_state_list=[]
+        # for i in range(max_len2):
+        #     alternatives_state_list.append(alternatives_state)
+        # al=tf.reshape(tf.concat(alternatives_state_list,axis=1),[-1,self.hidden_size])
+        outputs2=tf.concat([tf.reshape(outputs2,[-1,self.hidden_size*2])],axis=1)
+        outputs2=tf.transpose(outputs2)
+        tmp=tf.matmul(self.attention_weight,outputs2)
+        tmp=tf.transpose(tf.reshape(tf.transpose(tmp),[-1,max_len2,self.hidden_size*2]),perm=[0, 2, 1])
+        tmp=tf.matmul(outputs1,tmp)
+
+        mask=tf.reshape(tf.sequence_mask(len2,max_len2, dtype=tf.float32),[-1,max_len2,1])
+        tmp=tf.matmul(tmp,mask)
+
+        tmp=tf.reshape(tmp,[-1,max_len1])*tf.sequence_mask(len1,max_len1, dtype=tf.float32)
+        tmp=tf.reshape(tmp,[-1,1,max_len1])
+        return tf.reshape(tf.matmul(tmp,outputs1),[-1,self.hidden_size*2])
+
+    def computer_loss(self):
+        tv = tf.trainable_variables()
+        for tensor in tv:
+            try:
+                if not 'bias' in tensor.name and not 'embedding' in tensor.name and not 'output' in tensor.name:
+                    print(tensor)
+                    tf.add_to_collection("losses", tf.contrib.layers.l2_regularizer(0.001)(tensor))
+            except:
+                pass
+        self.loss_l2=tf.add_n(tf.get_collection("losses"))
+        # self.loss_l2=tf.constant(1)
+        tf.add_to_collection("losses",
+                             tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.y_input,
+                                                                                           logits=self.middle_out)))
+        self.loss=tf.add_n(tf.get_collection("losses"))
+
+    def _train(self):
+        trainable_variables = tf.trainable_variables()
+        grads = tf.gradients(self.loss, trainable_variables)
+        grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
+        opt = tf.train.AdadeltaOptimizer(learning_rate=tf.clip_by_value(self.lr,0.01,5))
+        self.train_op = opt.apply_gradients(zip(grads, trainable_variables),global_step=self.global_step)
+
+    def val_(self, sess, tensor_list, feed_dict):
+        max_len=len(feed_dict['query'])
+        scale=1500
+        out=[]
+        for i in range(10000):
+            out.append(sess.run(tensor_list,feed_dict={self.query_input: feed_dict['query'][i * scale:min((i + 1) * scale, max_len)],
+                              self.query_len_input: feed_dict['query_len'][i * scale:min((i + 1) * scale, max_len)],
+                              self.passage_input: feed_dict['passage'][i * scale:min((i + 1) * scale, max_len)],
+                              self.passage_len_input: feed_dict['passage_len'][i * scale:min((i + 1) * scale, max_len)],
+                              self.alternatives_input: feed_dict['alternative'][i * scale:min((i + 1) * scale, max_len)],
+                              self.alternatives_len_input: feed_dict['alternative_len'][i * scale:min((i + 1) * scale, max_len)],
+                              self.y_input: feed_dict['answer'][i * scale:min((i + 1) * scale, max_len)],
+                              self.keep_pro: 1}))
+            if (i+1)*scale>=max_len:
+                break
+        return out
+
+
+class MANM_5_Model:
+
+    def __init__(self,config):
+        self.hidden_size=config['hidden_size']
+        self.num_layers=config['num_layers']
+        self.word_dim=config['word_dim']
+        self.voc_len=config['voc_len']
+
+        self.max_len_passage=config['max_len_passage']
+        self.max_len_query = config['max_len_query']
+        self.max_len_alternatives=config['max_len_alternatives']
+        self.feature_extract_layer_num=3
+        self.output_layer_num=5
+
+        self.global_step = tf.Variable(0)
+        self.lr = tf.train.exponential_decay(config['lr'], self.global_step, 800, 0.96, staircase=True)
+
+        self.max_grad_norm=config['max_grad_norm']
+        self.auto_NN={}
+        self.build_placeholder()
+        self.build_para()
+        self.forward_step0()
+        self.computer_loss()
+        self._train()
+
+    def build_placeholder(self):
+        self.keep_pro=tf.placeholder(dtype=tf.float32,name='keep_pro')
+
+        self.query_input=tf.placeholder(dtype=tf.int32,shape=[None,self.max_len_query],name='query_input')
+        self.passage_input=tf.placeholder(dtype=tf.int32,shape=[None,self.max_len_passage],name='passage_input')
+
+        self.query_len_input = tf.placeholder(dtype=tf.int32, shape=[None], name='query_len_input')
+        self.passage_len_input = tf.placeholder(dtype=tf.int32, shape=[None], name='passage_len_input')
+
+        self.y_input=tf.placeholder(dtype=tf.int32,shape=[None],name='y_input')
+        self.alternatives_input=tf.placeholder(dtype=tf.int32,shape=[None,3,self.max_len_alternatives],name='alternatives_input')
+        self.alternatives_len_input=tf.placeholder(dtype=tf.int32,shape=[None,3],name='alternatives_len_input')
+
+    def build_para(self):
+        self.initializer = tf.random_uniform_initializer(-0.1, 0.1)
+        with tf.variable_scope('word_embedding'):
+            print('loading embedding')
+            self.word_embedding=tf.get_variable(dtype=tf.float32,
+                                                initializer=tf.constant(np.load('../../DATA/data/embedding.npy'),
+                                                                        dtype=tf.float32),name='word_embedding',trainable=True)
+            print('done')
+        with tf.variable_scope('LSTM_encoder',reuse=None):
+
+            self.query_cell_fw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+
+            self.query_cell_bw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+
+            self.passage_cell_fw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+            self.passage_cell_bw = tf.nn.rnn_cell.DropoutWrapper(
+                tf.nn.rnn_cell.LSTMCell(self.hidden_size), input_keep_prob=self.keep_pro,
+                output_keep_prob=self.keep_pro, state_keep_prob=self.keep_pro)
+
+            self.alternatives_cell=tf.nn.rnn_cell.LSTMCell(self.hidden_size)
+
+        with tf.variable_scope('attention'):
+            self.attention_weight=tf.get_variable(dtype=tf.float32,shape=[self.hidden_size*2,self.hidden_size*2],initializer=self.initializer,name='attention_weight')
+            self.attention_weight_with_al=tf.get_variable(dtype=tf.float32,shape=[self.hidden_size,self.hidden_size*2],initializer=self.initializer,name='attention_weight_with_al')
+        with tf.variable_scope('output_layer'):
+            self.generate_NN(self.hidden_size*5,1, self.output_layer_num,'output_layer')
+
+    def generate_NN(self,input_size,output_size,layers,name):
+        auto_NN_weights=[]
+        auto_NN_biases=[]
+        auto_NN_betas=[]
+        auto_NN_scales=[]
+        for i in range(layers):
+            if i==layers-1:
+                auto_NN_weights.append(tf.get_variable(dtype=tf.float32,shape=[input_size,output_size],
+                                                       name='auto_NN_weight_'+name+'_'+str(i),initializer=self.initializer))
+                auto_NN_biases.append(tf.get_variable(dtype=tf.float32,shape=[output_size],
+                                                      name='auto_NN_bias_'+name+'_'+str(i),initializer=self.initializer))
+            else:
+                auto_NN_weights.append(tf.get_variable(dtype=tf.float32, shape=[input_size , input_size ],
+                                                       name='auto_NN_weight_' +name+'_'+ str(i),initializer=self.initializer))
+                auto_NN_biases.append(tf.get_variable(dtype=tf.float32, shape=[input_size ],
+                                                      name='auto_NN_bias_' + name+'_'+str(i),initializer=self.initializer))
+
+            auto_NN_betas.append(tf.get_variable(dtype=tf.float32, shape=[1],name='auto_NN_beta_' +name+'_'+ str(i),initializer=self.initializer))
+            auto_NN_scales.append(tf.get_variable(dtype=tf.float32, shape=[1],name='auto_NN_scale_' + name + '_' + str(i),initializer=self.initializer))
+        self.auto_NN[name]=zip(auto_NN_weights,auto_NN_biases,auto_NN_betas,auto_NN_scales)
+
+    def forward_step0(self):
+        #这一部分主要是lstm编码过程
+        query_emb=tf.nn.embedding_lookup(self.word_embedding,self.query_input)
+
+        passage_emb = tf.nn.embedding_lookup(self.word_embedding, self.passage_input)
+
+        alternatives_emb_0 = tf.nn.embedding_lookup(self.word_embedding, self.alternatives_input[:, 0, :])
+        alternatives_emb_1 = tf.nn.embedding_lookup(self.word_embedding, self.alternatives_input[:, 1, :])
+        alternatives_emb_2 = tf.nn.embedding_lookup(self.word_embedding, self.alternatives_input[:, 2, :])
+
+        alternatives_emb=[alternatives_emb_0,alternatives_emb_1,alternatives_emb_2]
+
+        with tf.variable_scope('query_encoder'):
+            query_output, query_state = tf.nn.bidirectional_dynamic_rnn(self.query_cell_fw, self.query_cell_bw,
+                                                                                  query_emb, sequence_length=self.query_len_input, dtype=tf.float32)
+        with tf.variable_scope('passage_encoder'):
+            passage_output,passage_state=tf.nn.bidirectional_dynamic_rnn(self.passage_cell_fw, self.passage_cell_bw,
+                                                                                   passage_emb, sequence_length=self.passage_len_input, dtype=tf.float32)
+        with tf.variable_scope('alternatives_encoder'):
+            alternatives_output_0, alternatives_state_0 = dynamic_rnn(self.alternatives_cell, alternatives_emb[0],
+                                                                  sequence_length=self.alternatives_len_input[:,0], dtype=tf.float32)
+            alternatives_output_1, alternatives_state_1 = dynamic_rnn(self.alternatives_cell, alternatives_emb[1],
+                                                                sequence_length=self.alternatives_len_input[:, 1], dtype=tf.float32)
+            alternatives_output_2, alternatives_state_2 = dynamic_rnn(self.alternatives_cell, alternatives_emb[2],
+                                                                  sequence_length=self.alternatives_len_input[:, 2],
+                                                                  dtype=tf.float32)
+
+        alternatives_state=[self.get_h(alternatives_state_0),
+                            self.get_h(alternatives_state_1),
+                            self.get_h(alternatives_state_2)]
+        query_output=tf.concat(query_output,axis=2)
+        passage_output=tf.concat(passage_output,axis=2)
+        tmp0=self.forward_step1(alternatives_state[0], query_output, passage_output)
+        tmp1=self.forward_step1(alternatives_state[1], query_output, passage_output)
+        tmp2=self.forward_step1(alternatives_state[2], query_output, passage_output)
+        self.tmp=tf.concat([tmp0,tmp1,tmp2],axis=0)
+        self.middle_out=tf.transpose(tf.reshape(self.forward_step2(tf.concat([tmp0,tmp1,tmp2],axis=0)),[3,-1]))
+
+
+    def forward_step1(self,alternatives_state,query_output,passage_output):
+        query_attentioned=self.compute_attention(alternatives_state,query_output,passage_output,self.query_len_input,
+                                                 self.passage_len_input,self.max_len_query,self.max_len_passage)
+        passage_attentioned=self.compute_attention(alternatives_state,passage_output,query_output,self.passage_len_input,
+                                                   self.query_len_input,self.max_len_passage,self.max_len_query)
+        concated = tf.concat([query_attentioned,passage_attentioned, alternatives_state], axis=1)
+        return concated
+
+    def forward_step2(self,concated):
+        for idx, (weight, bias,beta,scale) in enumerate(self.auto_NN['output_layer']):
+            tmp=tf.nn.elu(tf.matmul(concated, weight) + bias)
+            batch_mean, batch_var = tf.nn.moments(tmp, [0])
+            BN = tf.nn.batch_normalization(tmp, batch_mean, batch_var, beta, scale, 1e-3)
+            if idx==self.output_layer_num-1:
+                concated=BN
+            else:
+                concated = tf.nn.dropout(BN,keep_prob=self.keep_pro)
+
+        return concated
+
+    def get_h(self, state):
+        c, h = state
+        h = tf.reshape(h, [-1, self.hidden_size])
+        return h
+
+    def compute_attention(self,alternatives_state,outputs1,outputs2,len1,len2,max_len1,max_len2):
+        mask = tf.reshape(tf.sequence_mask(len2, max_len2, dtype=tf.float32), [-1, max_len2, 1])
+        mask = self.sub_compute_attention(alternatives_state, outputs2, len2, max_len2)*mask
+
+        outputs2=tf.reshape(outputs2,[-1,self.hidden_size*2])
+        outputs2=tf.transpose(outputs2)
+        tmp=tf.matmul(self.attention_weight,outputs2)
+        tmp=tf.transpose(tf.reshape(tf.transpose(tmp),[-1,max_len2,self.hidden_size*2]),perm=[0, 2, 1])
+        tmp=tf.matmul(outputs1,tmp)
+
+        tmp=tf.matmul(tmp,mask)
+
+        tmp=tf.reshape(tmp,[-1,max_len1])*tf.sequence_mask(len1,max_len1, dtype=tf.float32)
+        tmp=tf.reshape(tmp,[-1,1,max_len1])
+        return tf.reshape(tf.matmul(tmp,outputs1),[-1,self.hidden_size*2])
+
+    def sub_compute_attention(self, state, outputs, length, max_len):
+        # outputs=tf.reshape(outputs,[-1,self.hidden_size*2])
+        return tf.reshape(tf.nn.softsign(
+                        tf.reshape(
+                            tf.matmul(
+                                outputs, tf.reshape(
+                                    tf.matmul(
+                                        state, self.attention_weight_with_al), shape=[-1, self.hidden_size*2, 1])),
+                            [-1, max_len]) * tf.sequence_mask(
+                            length, max_len, dtype=tf.float32)),[-1,max_len,1])
+
+    def computer_loss(self):
+        tv = tf.trainable_variables()
+        for tensor in tv:
+            try:
+                if not 'bias' in tensor.name and not 'embedding' in tensor.name and not 'output' in tensor.name:
+                    print(tensor)
+                    tf.add_to_collection("losses", tf.contrib.layers.l2_regularizer(0.001)(tensor))
+            except:
+                pass
+        self.loss_l2=tf.add_n(tf.get_collection("losses"))
+        # self.loss_l2=tf.constant(1)
+        tf.add_to_collection("losses",
+                             tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.y_input,
+                                                                                           logits=self.middle_out)))
+        self.loss=tf.add_n(tf.get_collection("losses"))
+
+    def _train(self):
+        trainable_variables = tf.trainable_variables()
+        grads = tf.gradients(self.loss, trainable_variables)
+        grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
         opt = tf.train.AdadeltaOptimizer(learning_rate=tf.clip_by_value(self.lr,0.01,5))
         self.train_op = opt.apply_gradients(zip(grads, trainable_variables),global_step=self.global_step)
 
