@@ -29,7 +29,8 @@ if __name__ =='__main__':
               '../../DATA/ai_challenger_oqmrc2018_validationset_20180816'
               '/ai_challenger_oqmrc_validationset_20180816/'
               'ai_challenger_oqmrc_validationset.json']
-
+    with open('../../DATA/data/stop_words','r',encoding='utf-8') as fo:
+        stop_word=[line.strip() for line in fo.readlines()]
 
     for file in filelist:
         with open('../../DATA/data/' + file.split('/')[-1], 'w',encoding='utf-8') as out_fo_0:
@@ -42,9 +43,11 @@ if __name__ =='__main__':
                         keys = ['passage', 'query']
                         for key in keys:
                             line_dic_char[key]= ' '.join([word.strip() for word in jb.cut(data[key])])
-
                             word_list = []
                             for word in line_dic_char[key].split(' '):
+                                # if word in stop_word:
+                                #     print(word)
+                                #     continue
                                 try:
                                     word_list.append(str(word_dic[word]))
                                 except:

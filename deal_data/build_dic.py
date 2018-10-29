@@ -18,17 +18,13 @@ jb.add_word('无法确定')
 #321301
 #321308
 word_dic={}
+
+
 n=0
-word_dic['##1']=n
-n+=1
-word_dic['##2']=n
-n+=1
-word_dic['##3']=n
-n+=1
-word_dic['##4']=n
-n+=1
-word_dic['##5']=n
-n+=1
+
+for i in range(200):
+    word_dic['##'+str(i)]=n
+    n+=1
 
 filelist=['../../DATA/ai_challenger_oqmrc2018_trainingset_20180816/'
           'ai_challenger_oqmrc_trainingset_20180816/'

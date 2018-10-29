@@ -196,7 +196,7 @@ class data_helper:
         answer=[]
 
         while size>0:
-            if rd.random()<0.3:
+            if rd.random()<0.5:
                 continue
             line=self.train_file_fo.readline()
             if line=='':

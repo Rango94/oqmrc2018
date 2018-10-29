@@ -19,10 +19,10 @@ while len(word_dic)>0:
     for key in word_dic:
         if word_dic[key]==n:
             try:
-                norm=math.pow(np.sum(vectors_dic[key]**2),0.5)
-                embedding.append(vectors_dic[key]/norm)
+                # norm=math.pow(np.sum(vectors_dic[key]**2),0.5)
+                embedding.append(vectors_dic[key])
             except:
-                embedding.append(np.zeros(128))
+                embedding.append(np.random.random(128))
             n+=1
             word_dic.pop(key)
             break
